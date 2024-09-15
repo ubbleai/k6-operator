@@ -19,6 +19,7 @@ func TestNewInitializerJob(t *testing.T) {
 	}
 
 	automountServiceAccountToken := true
+	zero := int32(0)
 
 	expectedOutcome := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -34,6 +35,7 @@ func TestNewInitializerJob(t *testing.T) {
 			},
 		},
 		Spec: batchv1.JobSpec{
+			BackoffLimit: &zero,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
@@ -50,19 +52,33 @@ func TestNewInitializerJob(t *testing.T) {
 					ServiceAccountName:           "default",
 					Affinity:                     nil,
 					NodeSelector:                 nil,
+					Tolerations:                  nil,
+					TopologySpreadConstraints:    nil,
 					RestartPolicy:                corev1.RestartPolicyNever,
+					SecurityContext:              &corev1.PodSecurityContext{},
 					Containers: []corev1.Container{
 						{
-							Image: "ghcr.io/grafana/operator:latest-runner",
-							Name:  "k6",
+							Image:           "ghcr.io/grafana/k6-operator:latest-runner",
+							ImagePullPolicy: "",
+							Name:            "k6",
 							Command: []string{
 								"sh", "-c",
-								"k6 archive /test/test.js -O ./test.js.archived.tar --out cloud && k6 inspect --execution-requirements ./test.js.archived.tar",
+								"mkdir -p $(dirname /tmp/test.js.archived.tar) && k6 archive /test/test.js -O /tmp/test.js.archived.tar --out cloud 2> /tmp/k6logs && k6 inspect --execution-requirements /tmp/test.js.archived.tar 2> /tmp/k6logs ; ! cat /tmp/k6logs | grep 'level=error'",
 							},
-							Env:          []corev1.EnvVar{},
-							Resources:    corev1.ResourceRequirements{},
-							VolumeMounts: script.VolumeMount(),
-							Ports:        []corev1.ContainerPort{{ContainerPort: 6565}},
+							Env: []corev1.EnvVar{},
+							EnvFrom: []corev1.EnvFromSource{
+								{
+									ConfigMapRef: &corev1.ConfigMapEnvSource{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: "env",
+										},
+									},
+								},
+							},
+							Resources:       corev1.ResourceRequirements{},
+							VolumeMounts:    script.VolumeMount(),
+							Ports:           []corev1.ContainerPort{{ContainerPort: 6565}},
+							SecurityContext: &corev1.SecurityContext{},
 						},
 					},
 					Volumes: script.Volume(),
@@ -71,12 +87,12 @@ func TestNewInitializerJob(t *testing.T) {
 		},
 	}
 
-	k6 := &v1alpha1.K6{
+	k6 := &v1alpha1.TestRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "test",
 		},
-		Spec: v1alpha1.K6Spec{
+		Spec: v1alpha1.TestRunSpec{
 			Script: v1alpha1.K6Script{
 				ConfigMap: v1alpha1.K6Configmap{
 					Name: "test",
@@ -84,13 +100,22 @@ func TestNewInitializerJob(t *testing.T) {
 				},
 			},
 			Arguments: "--out cloud",
-			Runner: v1alpha1.Pod{
+			Initializer: &v1alpha1.Pod{
 				Metadata: v1alpha1.PodMetadata{
 					Labels: map[string]string{
 						"label1": "awesome",
 					},
 					Annotations: map[string]string{
 						"awesomeAnnotation": "dope",
+					},
+				},
+				EnvFrom: []corev1.EnvFromSource{
+					{
+						ConfigMapRef: &corev1.ConfigMapEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: "env",
+							},
+						},
 					},
 				},
 			},

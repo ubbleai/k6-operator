@@ -16,39 +16,53 @@ package controllers
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/go-logr/logr"
+	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+
 	"github.com/grafana/k6-operator/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
+	v1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// K6Reconciler reconciles a K6 object
+const (
+	k6CrLabelName = "k6_cr"
+)
+
 type K6Reconciler struct {
-	client.Client
-	Log    logr.Logger
-	Scheme *runtime.Scheme
+	t *TestRunReconciler
+}
+
+func NewK6Reconciler(t *TestRunReconciler) *K6Reconciler {
+	return &K6Reconciler{t}
 }
 
 // Reconcile takes a K6 object and takes the appropriate action in the cluster
 // +kubebuilder:rbac:groups=k6.io,resources=k6s,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=k6.io,resources=k6s/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=k6.io,resources=k6s/status;k6s/finalizers,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;
+// +kubebuilder:rbac:groups=core,resources=pods;pods/log,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-func (r *K6Reconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	ctx := context.Background()
-	log := r.Log.WithValues("k6", req.NamespacedName)
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;create;update
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+
+func (r *K6Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := r.t.Log.WithValues("namespace", req.Namespace, "name", req.Name, "reconcileID", controller.ReconcileIDFromContext(ctx))
 
 	// Fetch the CRD
 	k6 := &v1alpha1.K6{}
-	err := r.Get(ctx, req.NamespacedName, k6)
+	err := r.t.Get(ctx, req.NamespacedName, k6)
+
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if k8sErrors.IsNotFound(err) {
 			log.Info("Request deleted. Nothing to reconcile.")
 			return ctrl.Result{}, nil
 		}
@@ -56,36 +70,7 @@ func (r *K6Reconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		return ctrl.Result{Requeue: true}, err
 	}
 
-	log.Info(fmt.Sprintf("Reconcile(); stage = %s", k6.Status.Stage))
-
-	switch k6.Status.Stage {
-	case "":
-		return InitializeJobs(ctx, log, k6, r)
-	case "initialization":
-		// here we're just waiting until initialize is done
-		// Note: it is present as a separate stage to ensure there's only one
-		// initialization job at a time
-		return ctrl.Result{}, nil
-	case "initialized":
-		return CreateJobs(ctx, log, k6, r)
-	case "created":
-		return StartJobs(ctx, log, k6, r)
-	case "started":
-		// wait for test to finish and then mark as finished
-		return FinishJobs(ctx, log, k6, r)
-	case "finished":
-		// delete if configured
-		if k6.Spec.Cleanup == "post" {
-			log.Info("Cleaning up all resources")
-			r.Delete(ctx, k6)
-		}
-		// notify if configured
-		return ctrl.Result{}, nil
-	}
-
-	err = fmt.Errorf("invalid status")
-	log.Error(err, "Invalid status for the k6 resource.")
-	return ctrl.Result{}, err
+	return r.t.reconcile(ctx, req, log, k6)
 }
 
 // SetupWithManager sets up a managed controller that will reconcile all events for the K6 CRD
@@ -93,5 +78,29 @@ func (r *K6Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.K6{}).
 		Owns(&batchv1.Job{}).
+		Watches(&v1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(
+				func(ctx context.Context, object client.Object) []reconcile.Request {
+					pod := object.(*v1.Pod)
+					k6CrName, ok := pod.GetLabels()[k6CrLabelName]
+					if !ok {
+						return nil
+					}
+					return []reconcile.Request{
+						{NamespacedName: types.NamespacedName{
+							Name:      k6CrName,
+							Namespace: object.GetNamespace(),
+						}}}
+				}),
+			builder.WithPredicates(predicate.NewPredicateFuncs(
+				func(object client.Object) bool {
+					pod := object.(*v1.Pod)
+					_, ok := pod.GetLabels()[k6CrLabelName]
+					return ok
+				}))).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: 1,
+			// RateLimiter - ?
+		}).
 		Complete(r)
 }

@@ -1,48 +1,27 @@
 package controllers
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"time"
+
+	"github.com/grafana/k6-operator/pkg/types"
 
 	"github.com/go-logr/logr"
 	"github.com/grafana/k6-operator/api/v1alpha1"
 	"github.com/grafana/k6-operator/pkg/cloud"
 	"github.com/grafana/k6-operator/pkg/resources/jobs"
-	"github.com/grafana/k6-operator/pkg/types"
 	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-)
-
-// k6 Cloud related vars
-// Right now operator works with one test at a time so these should be safe.
-var (
-	testRunId     string
-	token         string
-	inspectOutput cloud.InspectOutput
 )
 
 // InitializeJobs creates jobs that will run initial checks for distributed test if any are necessary
-func InitializeJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.K6, r *K6Reconciler) (res ctrl.Result, err error) {
-	log.Info("Initialize test")
+func InitializeJobs(ctx context.Context, log logr.Logger, k6 v1alpha1.TestRunI, r *TestRunReconciler) (res ctrl.Result, err error) {
+	// initializer is a quick job so check in frequently
+	res = ctrl.Result{RequeueAfter: time.Second * 5}
 
-	log.Info("Changing stage of K6 status to initialization")
-	k6.Status.Stage = "initialization"
-	if err = r.Client.Status().Update(ctx, k6); err != nil {
-		log.Error(err, "Could not update status of custom resource")
-		return
-	}
-
-	cli := types.ParseCLI(&k6.Spec)
+	cli := types.ParseCLI(k6.GetSpec().Arguments)
 
 	var initializer *batchv1.Job
 	if initializer, err = jobs.NewInitializerJob(k6, cli.ArchiveArgs); err != nil {
@@ -54,161 +33,158 @@ func InitializeJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.K6, r *K6
 
 	if err = ctrl.SetControllerReference(k6, initializer, r.Scheme); err != nil {
 		log.Error(err, "Failed to set controller reference for the initialize job")
-		return
+		return res, err
 	}
 
 	if err = r.Create(ctx, initializer); err != nil {
 		log.Error(err, "Failed to launch k6 test initializer")
-		return
-	}
-	err = wait.PollImmediate(time.Second*5, time.Second*60, func() (done bool, err error) {
-		var (
-			listOpts = &client.ListOptions{
-				Namespace: k6.Namespace,
-				LabelSelector: labels.SelectorFromSet(map[string]string{
-					"app":      "k6",
-					"k6_cr":    k6.Name,
-					"job-name": fmt.Sprintf("%s-initializer", k6.Name),
-				}),
-			}
-			podList = &corev1.PodList{}
-		)
-		if err := r.List(ctx, podList, listOpts); err != nil {
-			log.Error(err, "Could not list pods")
-			return false, err
-		}
-		if len(podList.Items) < 1 {
-			log.Info("No initializing pod found yet")
-			return false, nil
-		}
-
-		// there should be only 1 initializer pod
-		if podList.Items[0].Status.Phase != "Succeeded" {
-			log.Info("Waiting for initializing pod to finish")
-			return false, nil
-		}
-
-		// Here we need to get the output of the pod
-		// pods/log is not currently supported by controller-runtime client and it is officially
-		// recommended to use REST client instead:
-		// https://github.com/kubernetes-sigs/controller-runtime/issues/1229
-
-		var opts corev1.PodLogOptions
-		config, err := rest.InClusterConfig()
-		if err != nil {
-			log.Error(err, "unable to fetch in-cluster REST config")
-			// don't return here
-			return false, nil
-		}
-
-		clientset, err := kubernetes.NewForConfig(config)
-		if err != nil {
-			log.Error(err, "unable to get access to clientset")
-			// don't return here
-			return false, nil
-		}
-		req := clientset.CoreV1().Pods(k6.Namespace).GetLogs(podList.Items[0].Name, &opts)
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
-		defer cancel()
-
-		podLogs, err := req.Stream(ctx)
-		if err != nil {
-			log.Error(err, "unable to stream logs from the pod")
-			// don't return here
-			return false, nil
-		}
-		defer podLogs.Close()
-
-		buf := new(bytes.Buffer)
-		_, err = io.Copy(buf, podLogs)
-		if err != nil {
-			log.Error(err, "unable to copy logs from the pod")
-			return false, err
-		}
-
-		if err := json.Unmarshal(buf.Bytes(), &inspectOutput); err != nil {
-			// this shouldn't normally happen but if it does, let's log output by default
-			log.Error(err, fmt.Sprintf("unable to marshal: `%s`", buf.String()))
-			return true, err
-		}
-
-		log.Info(fmt.Sprintf("k6 inspect: %+v", inspectOutput))
-
-		if int32(inspectOutput.MaxVUs) < k6.Spec.Parallelism {
-			err = fmt.Errorf("number of instances > number of VUs")
-			// TODO maybe change this to a warning and simply set parallelism = maxVUs and proceed with execution?
-			// But logr doesn't seem to have warning level by default, only with V() method...
-			// It makes sense to return to this after / during logr VS logrus issue https://github.com/grafana/k6-operator/issues/84
-			log.Error(err, "Parallelism argument cannot be larger than maximum VUs in the script",
-				"maxVUs", inspectOutput.MaxVUs,
-				"parallelism", k6.Spec.Parallelism)
-			return false, err
-		}
-
-		return true, nil
-	})
-
-	if err != nil {
-		log.Error(err, "Failed to initialize the script")
-		return
-	}
-
-	if cli.HasCloudOut {
-		var (
-			secrets    corev1.SecretList
-			secretOpts = &client.ListOptions{
-				// TODO: find out a better way to get namespace here
-				Namespace: "k6-operator-system",
-				LabelSelector: labels.SelectorFromSet(map[string]string{
-					"k6cloud": "token",
-				}),
-			}
-		)
-		if err := r.List(ctx, &secrets, secretOpts); err != nil {
-			log.Error(err, "Failed to load k6 Cloud token")
-			return res, err
-		}
-
-		if len(secrets.Items) < 1 {
-			err := fmt.Errorf("There are no secrets to hold k6 Cloud token")
-			log.Error(err, err.Error())
-			return res, err
-		}
-
-		if t, ok := secrets.Items[0].Data["token"]; !ok {
-			err := fmt.Errorf("The secret doesn't have a field token for k6 Cloud")
-			log.Error(err, err.Error())
-			return res, err
-		} else {
-			token = string(t)
-		}
-		log.Info("Token for k6 Cloud was loaded.")
-
-		host := getEnvVar(k6.Spec.Runner.Env, "K6_CLOUD_HOST")
-
-		if refID, err := cloud.CreateTestRun(inspectOutput, k6.Spec.Parallelism, host, token, log); err != nil {
-			return res, err
-		} else {
-			testRunId = refID
-			log.Info(fmt.Sprintf("Created cloud test run: %s", testRunId))
-		}
-	}
-
-	log.Info("Changing stage of K6 status to initialized")
-	k6.Status.Stage = "initialized"
-	if err = r.Client.Status().Update(ctx, k6); err != nil {
-		log.Error(err, "Could not update status of custom resource")
-		return
+		return res, err
 	}
 
 	return res, nil
 }
 
-func getEnvVar(vars []corev1.EnvVar, name string) string {
-	for _, v := range vars {
-		if v.Name == name {
-			return v.Value
+func RunValidations(ctx context.Context, log logr.Logger, k6 v1alpha1.TestRunI, r *TestRunReconciler) (
+	res ctrl.Result, ready bool, err error,
+) {
+	// initializer is a quick job so check in frequently
+	res = ctrl.Result{RequeueAfter: time.Second * 5}
+
+	cli := types.ParseCLI(k6.GetSpec().Arguments)
+
+	inspectOutput, inspectReady, err := inspectTestRun(ctx, log, k6, r.Client)
+	if err != nil {
+		// Cloud output test run is not created yet at this point, so sending
+		// events is possible only for PLZ test run.
+		if v1alpha1.IsTrue(k6, v1alpha1.CloudPLZTestRun) {
+			// This error won't allow to start a test so let k6 Cloud know of it
+			events := cloud.ErrorEvent(cloud.K6OperatorStartError).
+				WithDetail(fmt.Sprintf("Failed to inspect the test script: %v", err)).
+				WithAbort()
+			cloud.SendTestRunEvents(r.k6CloudClient, v1alpha1.TestRunID(k6), log, events)
+		} else {
+			// if there is any error, we have to reflect it on the K6 manifest
+			k6.GetStatus().Stage = "error"
+			if _, err := r.UpdateStatus(ctx, k6, log); err != nil {
+				return ctrl.Result{}, ready, err
+			}
+
+			return ctrl.Result{}, ready, nil
+		}
+
+		// inspectTestRun made a log message already so just return without requeue
+		return ctrl.Result{}, ready, err
+	}
+	if !inspectReady {
+		return res, ready, nil
+	}
+
+	log.Info(fmt.Sprintf("k6 inspect: %+v", inspectOutput))
+
+	if int32(inspectOutput.MaxVUs) < k6.GetSpec().Parallelism {
+		err = fmt.Errorf("number of instances > number of VUs")
+		// TODO maybe change this to a warning and simply set parallelism = maxVUs and proceed with execution?
+		// But logr doesn't seem to have warning level by default, only with V() method...
+		// It makes sense to return to this after / during logr VS logrus issue https://github.com/grafana/k6-operator/issues/84
+		log.Error(err, "Parallelism argument cannot be larger than maximum VUs in the script",
+			"maxVUs", inspectOutput.MaxVUs,
+			"parallelism", k6.GetSpec().Parallelism)
+
+		k6.GetStatus().Stage = "error"
+
+		if _, err := r.UpdateStatus(ctx, k6, log); err != nil {
+			return ctrl.Result{}, ready, err
+		}
+
+		// Don't requeue in case of this error; unless it's made into a warning as described above.
+		return ctrl.Result{}, ready, nil
+	}
+
+	if cli.HasCloudOut {
+		v1alpha1.UpdateCondition(k6, v1alpha1.CloudTestRun, metav1.ConditionTrue)
+
+		if v1alpha1.IsUnknown(k6, v1alpha1.CloudTestRunCreated) {
+			// In case of PLZ test run, this is already set to true
+			v1alpha1.UpdateCondition(k6, v1alpha1.CloudTestRunCreated, metav1.ConditionFalse)
+		}
+
+		v1alpha1.UpdateCondition(k6, v1alpha1.CloudTestRunFinalized, metav1.ConditionFalse)
+	} else {
+		v1alpha1.UpdateCondition(k6, v1alpha1.CloudTestRun, metav1.ConditionFalse)
+	}
+
+	if _, err := r.UpdateStatus(ctx, k6, log); err != nil {
+		return ctrl.Result{}, ready, err
+	}
+
+	ready = true
+
+	return res, ready, nil
+}
+
+// SetupCloudTest inspects the output of initializer and creates a new
+// test run. It is meant to be used only in cloud output mode.
+func SetupCloudTest(ctx context.Context, log logr.Logger, k6 v1alpha1.TestRunI, r *TestRunReconciler) (res ctrl.Result, err error) {
+	res = ctrl.Result{RequeueAfter: time.Second * 5}
+
+	inspectOutput, inspectReady, err := inspectTestRun(ctx, log, k6, r.Client)
+	if err != nil {
+		// This *shouldn't* fail since it was already done once. Don't requeue.
+		// Alternatively: store inspect options in K6 Status? Get rid off reading logs?
+		return ctrl.Result{}, nil
+	}
+	if !inspectReady {
+		return res, nil
+	}
+
+	token, tokenReady, err := loadToken(ctx, log, r.Client, "", nil)
+	if err != nil {
+		// An error here means a very likely mis-configuration of the token.
+		// Consider updating status to error to let a user know quicker?
+		log.Error(err, "A problem while getting token.")
+		return ctrl.Result{}, nil
+	}
+	if !tokenReady {
+		return res, nil
+	}
+
+	host := getEnvVar(k6.GetSpec().Runner.Env, "K6_CLOUD_HOST")
+
+	if v1alpha1.IsFalse(k6, v1alpha1.CloudTestRunCreated) {
+
+		// If CloudTestRunCreated has just been updated, wait for a bit before
+		// acting, to avoid race condition between different reconcile loops.
+		t, _ := v1alpha1.LastUpdate(k6, v1alpha1.CloudTestRunCreated)
+		if time.Since(t) < 5*time.Second {
+			return ctrl.Result{RequeueAfter: time.Second * 2}, nil
+		}
+
+		if len(inspectOutput.TestName()) < 1 {
+			// script has already been parsed for initializer job definition,
+			// so this is safe
+			script, _ := k6.GetSpec().ParseScript()
+			inspectOutput.SetTestName(script.Filename)
+		}
+
+		if testRunData, err := cloud.CreateTestRun(inspectOutput, k6.GetSpec().Parallelism, host, token, log); err != nil {
+			log.Error(err, "Failed to create a new cloud test run.")
+			return res, nil
+		} else {
+			log = log.WithValues("testRunId", testRunData.ReferenceID)
+			log.Info(fmt.Sprintf("Created cloud test run: %s", testRunData.ReferenceID))
+
+			k6.GetStatus().TestRunID = testRunData.ReferenceID
+			v1alpha1.UpdateCondition(k6, v1alpha1.CloudTestRunCreated, metav1.ConditionTrue)
+
+			k6.GetStatus().AggregationVars = cloud.EncodeAggregationConfig(testRunData.ConfigOverride)
+
+			_, err := r.UpdateStatus(ctx, k6, log)
+			// log.Info(fmt.Sprintf("Debug updating status after create %v", updateHappened))
+			if err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 	}
-	return ""
+
+	return ctrl.Result{}, nil
 }

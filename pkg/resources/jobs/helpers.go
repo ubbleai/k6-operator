@@ -1,7 +1,10 @@
 package jobs
 
 import (
+	"fmt"
 	"strconv"
+
+	"github.com/grafana/k6-operator/pkg/types"
 
 	"github.com/grafana/k6-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -25,9 +28,7 @@ func newIstioCommand(istioEnabled string, inheritedCommands []string) ([]string,
 		command = append(command, "scuttle")
 	}
 
-	for _, inheritedCommand := range inheritedCommands {
-		command = append(command, inheritedCommand)
-	}
+	command = append(command, inheritedCommands...)
 
 	return command, istio
 }
@@ -84,10 +85,10 @@ func newIstioEnvVar(istio v1alpha1.K6Scuttle, istioEnabled bool) []corev1.EnvVar
 			})
 		}
 
-		if istio.ScuttleLogging {
+		if istio.DisableLogging {
 			env = append(env, corev1.EnvVar{
 				Name:  "SCUTTLE_LOGGING",
-				Value: strconv.FormatBool(istio.ScuttleLogging),
+				Value: strconv.FormatBool(false),
 			})
 		}
 
@@ -113,4 +114,35 @@ func newIstioEnvVar(istio v1alpha1.K6Scuttle, istioEnabled bool) []corev1.EnvVar
 		}
 	}
 	return env
+}
+
+// TODO: Envoy variables are not passed to init containers
+func getInitContainers(pod *v1alpha1.Pod, script *types.Script) []corev1.Container {
+	var initContainers []corev1.Container
+
+	for i, k6InitContainer := range pod.InitContainers {
+
+		name := fmt.Sprintf("k6-init-%d", i)
+		if k6InitContainer.Name != "" {
+			name = k6InitContainer.Name
+		}
+
+		volumeMounts := append(script.VolumeMount(), k6InitContainer.VolumeMounts...)
+
+		initContainer := corev1.Container{
+			Name:            name,
+			Image:           k6InitContainer.Image,
+			Command:         k6InitContainer.Command,
+			Args:            k6InitContainer.Args,
+			WorkingDir:      k6InitContainer.WorkingDir,
+			EnvFrom:         k6InitContainer.EnvFrom,
+			Env:             k6InitContainer.Env,
+			VolumeMounts:    volumeMounts,
+			ImagePullPolicy: pod.ImagePullPolicy,
+			SecurityContext: &pod.ContainerSecurityContext,
+		}
+		initContainers = append(initContainers, initContainer)
+	}
+
+	return initContainers
 }
